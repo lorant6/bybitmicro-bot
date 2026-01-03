@@ -3,3 +3,7 @@ venv/
 __pycache__/
 *.log
 .DS_Store
+live_settings.json
+trade_history.csv
+pardoned.json
+*.pyc
