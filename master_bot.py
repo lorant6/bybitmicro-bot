@@ -1,243 +1,309 @@
-import threading
-import time
-import random
-import logging
-import ccxt
-import requests
-import pandas as pd
-import pandas_ta as ta
-from tradingview_ta import TA_Handler, Interval
-from colorama import Fore, Style, init
-import config
+import threading, time, json, logging, os, requests, pandas as pd, pandas_ta as ta, datetime, hmac, hashlib, sys, urllib.parse
+import config 
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 API_KEY = config.API_KEY
 API_SECRET = config.API_SECRET
+TELEGRAM_TOKEN = config.TELEGRAM_TOKEN
+TARGET_CHAT_ID = "1143478179"
+BASE_DIR = os.getcwd()
+SETTINGS_FILE = os.path.join(BASE_DIR, "live_settings.json")
+LOG_FILE = os.path.join(BASE_DIR, "bot_v33.log")
 
-# --- GOD MODE SETTINGS ---
-ENABLE_NEWS_FILTER = False      
-# "WAR" has been removed to prevent false alarms
-PANIC_KEYWORDS = ['hack', 'banned', 'sec lawsuit', 'investigation', 'insolvent', 'arrested', 'collapse']
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)])
 
-# EXPERT SETTINGS
-RISK_PER_TRADE = 5.0        
-MAX_POSITION_SIZE = 50.0    
-ATR_MULTIPLIER_SL = 2.0     
-ATR_MULTIPLIER_TP = 4.0     
+# --- SETTINGS & STATE ---
+live_settings = {
+    "GLOBAL_STOP": True,       # Safety: Start PAUSED
+    "RISK_PER_TRADE": 2.0,     # USDT Margin per trade
+    "MAX_OPEN_POSITIONS": 5,   # PRO FEATURE: Max concurrent trades
+    "LEVERAGE": 10,
+    "ADX_THRESHOLD": 25.0
+}
 
-# --- LOGGING SETUP (Now saves to file!) ---
-init(autoreset=True)
-# Create handlers
-file_handler = logging.FileHandler('master_bot.log')
-stream_handler = logging.StreamHandler()
+# --- PRO PARAMETERS ---
+SCALP_TARGETS = ["SOLUSDT", "DOGEUSDT", "PEPEUSDT", "SUIUSDT", "WIFUSDT", "AVAXUSDT", "OPUSDT", "1000BONKUSDT"]
+# Scalp: Tight stops, fast activation
+SCALP_CONF = {"interval": "15", "sl_atr": 2.0, "trail_active_atr": 1.0, "trail_cb_atr": 0.3}
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(threadName)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[file_handler, stream_handler]
-)
-logger = logging.getLogger("GOD-MODE")
+SWING_TARGETS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "LINKUSDT", "LTCUSDT"]
+# Swing: Wide stops, slow activation
+SWING_CONF = {"interval": "60", "sl_atr": 3.0, "trail_active_atr": 2.0, "trail_cb_atr": 1.0}
 
-# --- SHARED GLOBAL STATE ---
-swing_watchlist = []
-scalp_watchlist = []
-MARKET_LOCKDOWN = False
+# Anti-Chop Cooldown (Minutes)
+COOLDOWN_MINUTES = 90 
 
-class NewsSentinel:
-    """GOD MODE (RSS VERSION): Bypasses API blocks to read news"""
-    def __init__(self):
-        self.rss_url = "https://cryptopanic.com/news/rss/"
-        
-    def run(self):
-        global MARKET_LOCKDOWN
-        if not ENABLE_NEWS_FILTER:
-            logger.warning("⚠️ God Mode News Filter is DISABLED.")
-            return
+scan_cache = {}
+active_symbols = []
+last_trade_time = {} # Tracks when a coin was last traded
+wallet_snapshot_24h = 0.0 
+global_btc_trend = "NEUTRAL" 
 
-        logger.info("👁️ NEWS SENTINEL: Watching RSS Feed for black swan events...")
-        
-        while True:
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                response = requests.get(self.rss_url, headers=headers, timeout=10)
-                
-                if response.status_code != 200:
-                    logger.warning(f"News Feed Error: Status {response.status_code}")
-                    time.sleep(300)
-                    continue
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w") as f: json.dump(live_settings, f, indent=4)
+    except: pass
 
-                raw_data = response.text.lower()
-                panic_detected = False
-                trigger_word = ""
+if os.path.exists(SETTINGS_FILE):
+    try:
+        with open(SETTINGS_FILE, "r") as f: live_settings.update(json.load(f))
+    except: pass
 
-                for word in PANIC_KEYWORDS:
-                    if word in raw_data:
-                        if raw_data.find(word) < 4000: 
-                            panic_detected = True
-                            trigger_word = word
-                            break
-                
-                if panic_detected:
-                    if not MARKET_LOCKDOWN:
-                        logger.error(f"🛑 GOD MODE ACTIVATED: '{trigger_word.upper()}' detected in news!")
-                        logger.error("🛑 MARKET LOCKDOWN ENGAGED (Pausing Buys)")
-                    MARKET_LOCKDOWN = True
-                else:
-                    if MARKET_LOCKDOWN:
-                        logger.info(f"✅ News Clear. Lifting Lockdown.")
-                    MARKET_LOCKDOWN = False
-                    
-            except Exception as e:
-                logger.error(f"News Scan Error: {e}")
-            time.sleep(300)
-
-class MarketScanner:
-    def __init__(self):
-        self.exchange = ccxt.bybit()
-
-    def run(self):
-        global swing_watchlist, scalp_watchlist
-        logger.info("📡 SCANNER: Initialized.")
-        while True:
-            try:
-                tickers = self.exchange.fetch_tickers()
-                valid = []
-                for s, d in tickers.items():
-                    if "/USDT:USDT" not in s: continue
-                    if d['quoteVolume'] is None or d['quoteVolume'] < 5000000: continue
-                    valid.append({'symbol': s, 'vol': d['quoteVolume'], 'chg': abs(d['percentage'] or 0)})
-                
-                valid.sort(key=lambda x: x['vol'], reverse=True)
-                swing_watchlist = [x['symbol'] for x in valid[:12]]
-                
-                scalp_cands = [x for x in valid if x['symbol'] not in swing_watchlist]
-                scalp_cands.sort(key=lambda x: x['chg'], reverse=True)
-                scalp_watchlist = [x['symbol'] for x in scalp_cands[:12]]
-                
-                logger.info(f"💎 Lists Updated: {len(swing_watchlist)} Swing | {len(scalp_watchlist)} Scalp")
-            except: pass
-            time.sleep(3600)
-
-class BotInstance:
-    def __init__(self, name, interval):
-        self.name = name
-        self.interval = interval
-        self.exchange = ccxt.bybit({
-            'apiKey': API_KEY, 'secret': API_SECRET,
-            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
-        })
-
-    def get_atr(self, symbol, period=14):
+# --- BYBIT API ---
+class BybitPrivate:
+    BASE_URL = "https://api.bybit.com"
+    
+    @staticmethod
+    def send_signed(method, endpoint, payload={}):
         try:
-            timeframe = '15m' if self.interval == Interval.INTERVAL_15_MINUTES else '5m'
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=period+5)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol'])
-            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=period)
-            return df['atr'].iloc[-1]
+            ts = str(int(time.time() * 1000)); recv_window = "5000"
+            if method == "GET": param_str = urllib.parse.urlencode(payload); sign_str = ts+API_KEY+recv_window+param_str
+            else: param_str = json.dumps(payload); sign_str = ts+API_KEY+recv_window+param_str
+            signature = hmac.new(bytes(API_SECRET, "utf-8"), sign_str.encode("utf-8"), hashlib.sha256).hexdigest()
+            headers = {"X-BAPI-API-KEY": API_KEY, "X-BAPI-SIGN": signature, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
+            url = f"{BybitPrivate.BASE_URL}{endpoint}"
+            if method == "GET": return requests.get(url, headers=headers, params=payload, timeout=5).json()
+            else: return requests.post(url, headers=headers, data=param_str, timeout=5).json()
+        except Exception as e: logging.error(f"API Error: {e}"); return None
+
+    @staticmethod
+    def get_balance():
+        try:
+            r = BybitPrivate.send_signed("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+            return float(r['result']['list'][0]['coin'][0]['walletBalance'])
+        except: return 0.0
+    
+    @staticmethod
+    def get_open_positions():
+        try:
+            r = BybitPrivate.send_signed("GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
+            return [p['symbol'] for p in r['result']['list'] if float(p['size']) > 0]
+        except: return []
+
+    @staticmethod
+    def set_trading_stop(symbol, entry_price, side, atr_value, conf):
+        sl_dist = atr_value * conf['sl_atr']
+        trail_active_dist = atr_value * conf['trail_active_atr']
+        trail_cb_dist = atr_value * conf['trail_cb_atr']
+
+        if side == "Buy":
+            sl_price = entry_price - sl_dist
+            activation_price = entry_price + trail_active_dist
+        else: 
+            sl_price = entry_price + sl_dist
+            activation_price = entry_price - trail_active_dist
+        
+        BybitPrivate.send_signed("POST", "/v5/position/trading-stop", {"category": "linear", "symbol": symbol, "stopLoss": str(round(sl_price, 4)), "positionIdx": 0})
+        BybitPrivate.send_signed("POST", "/v5/position/trading-stop", {"category": "linear", "symbol": symbol, "activationPrice": str(round(activation_price, 4)), "trailingStop": str(round(trail_cb_dist, 4)), "positionIdx": 0})
+        logging.info(f"🛡️ PROTECTED {symbol}")
+
+    @staticmethod
+    def place_order(symbol, side, price, atr_value, conf):
+        qty_calc = (live_settings['RISK_PER_TRADE'] * live_settings['LEVERAGE']) / price
+        if price > 100: qty = round(qty_calc, 3)
+        elif price > 1: qty = round(qty_calc, 1)
+        else: qty = int(qty_calc)
+
+        BybitPrivate.send_signed("POST", "/v5/position/set-leverage", {"category":"linear","symbol":symbol,"buyLeverage":str(live_settings['LEVERAGE']),"sellLeverage":str(live_settings['LEVERAGE'])})
+        payload = {"category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty)}
+        res = BybitPrivate.send_signed("POST", "/v5/order/create", payload)
+        
+        if res and res.get('retCode') == 0:
+            time.sleep(2) 
+            BybitPrivate.set_trading_stop(symbol, price, side, atr_value, conf)
+            return True
+        return False
+
+    @staticmethod
+    def kill_all():
+        BybitPrivate.send_signed("POST", "/v5/order/cancel-all", {"category": "linear", "settleCoin": "USDT"})
+        res = BybitPrivate.send_signed("GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
+        for p in res['result']['list']:
+            if float(p['size']) > 0:
+                payload = {"category": "linear", "symbol": p['symbol'], "side": "Buy" if p['side'] == "Sell" else "Sell", "orderType": "Market", "qty": p['size'], "reduceOnly": True}
+                BybitPrivate.send_signed("POST", "/v5/order/create", payload)
+        return True
+
+# --- EXPERT ENGINE ---
+class ExpertEngine:
+    @staticmethod
+    def check_btc_trend():
+        try:
+            url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=200"
+            res = requests.get(url, timeout=3).json()
+            df = pd.DataFrame(res['result']['list'][::-1], columns=['ts','o','h','l','c','v','t'])
+            df['c'] = pd.to_numeric(df['c'])
+            return "BULL" if df['c'].iloc[-1] > ta.ema(df['c'], length=200).iloc[-1] else "BEAR"
+        except: return "NEUTRAL"
+
+    @staticmethod
+    def get_market_info(symbol, interval):
+        try:
+            url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit=200"
+            res = requests.get(url, timeout=3).json()
+            df = pd.DataFrame(res['result']['list'][::-1], columns=['ts','o','h','l','c','v','t'])
+            df[['h','l','c','v']] = df[['h','l','c','v']].apply(pd.to_numeric)
+            
+            adx = ta.adx(df['h'], df['l'], df['c'])['ADX_14'].iloc[-1]
+            rsi = ta.rsi(df['c'], length=14).iloc[-1]
+            ema200 = ta.ema(df['c'], length=200).iloc[-1]
+            macd = ta.macd(df['c'])
+            macd_h = macd['MACDh_12_26_9'].iloc[-1]
+            atr = ta.atr(df['h'], df['l'], df['c'], length=14).iloc[-1]
+            vol_ma = ta.sma(df['v'], length=20).iloc[-1]
+            
+            price = df['c'].iloc[-1]
+            curr_vol = df['v'].iloc[-1]
+            signal = "WAIT"
+
+            # FILTER 1: Vol & Trend
+            if adx > live_settings['ADX_THRESHOLD'] and curr_vol > vol_ma:
+                # FILTER 2: Global Trend & RSI Check
+                if (price > ema200) and (macd_h > 0) and (50 < rsi < 70) and global_btc_trend == "BULL":
+                    signal = "LONG"
+                elif (price < ema200) and (macd_h < 0) and (30 < rsi < 50) and global_btc_trend == "BEAR":
+                    signal = "SHORT"
+            
+            return {"adx": adx, "slope": signal, "price": price, "atr": atr}
         except: return None
 
-    def manage_positions(self):
-        try:
-            positions = self.exchange.fetch_positions()
-            for p in positions:
-                if float(p.get('contracts', 0)) == 0: continue
-                symbol = p['symbol']
-                current_coins = swing_watchlist if self.name == "SWING" else scalp_watchlist
-                if symbol.split('/')[0] + "/USDT:USDT" not in current_coins: continue
+# --- TELEGRAM BOT ---
+class TelegramBot:
+    def __init__(self):
+        self.url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+        self.offset = 0
+        self.refresh_ui()
 
-                entry = float(p['entryPrice'])
-                curr_price = float(p['markPrice'])
-                stop_loss = float(p.get('stopLoss', 0))
-                side = p['side']
-                
-                if stop_loss == 0: continue
-                atr = self.get_atr(symbol)
-                if not atr: continue
-                trail_dist = atr * ATR_MULTIPLIER_SL 
-                
-                if side == 'long':
-                    new_sl = curr_price - trail_dist
-                    if new_sl > stop_loss and new_sl > entry:
-                        self.exchange.set_trading_stop(symbol, params={'stopLoss': str(new_sl)})
-                        logger.info(f"🚀 {self.name} TRAILING SL UP: {symbol} -> {new_sl:.4f}")
-                elif side == 'short':
-                    new_sl = curr_price + trail_dist
-                    if new_sl < stop_loss and new_sl < entry:
-                        self.exchange.set_trading_stop(symbol, params={'stopLoss': str(new_sl)})
-                        logger.info(f"📉 {self.name} TRAILING SL DOWN: {symbol} -> {new_sl:.4f}")
-        except: pass
+    def refresh_ui(self):
+        requests.post(f"{self.url}/deleteMyCommands")
+        time.sleep(1)
+        cmds = [
+            {"command": "status", "description": "📊 Status"},
+            {"command": "scan", "description": "🔍 Market Heatmap"},
+            {"command": "balance", "description": "💰 Balance"},
+            {"command": "risk", "description": "⚙️ Set Risk ($)"},
+            {"command": "adx", "description": "🛡️ Set ADX"},
+            {"command": "resume", "description": "🟢 START"},
+            {"command": "pause", "description": "🛑 STOP"},
+            {"command": "kill", "description": "⚠️ KILL POSITIONS"},
+            {"command": "reboot", "description": "♻️ Reboot"}
+        ]
+        requests.post(f"{self.url}/setMyCommands", json={"commands": cmds})
 
-    def execute_trade(self, symbol, signal):
-        if MARKET_LOCKDOWN and signal == 'BUY':
-            logger.warning(f"🛡️ GOD MODE BLOCKED BUY on {symbol} (News Lockdown)")
-            return
+    def send(self, msg):
+        requests.post(f"{self.url}/sendMessage", json={"chat_id": TARGET_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
-        try:
-            positions = self.exchange.fetch_positions()
-            for p in positions:
-                if p['symbol'] == symbol and float(p['contracts']) > 0: return
+    def handle(self, text):
+        global live_settings
+        args = text.split()
+        cmd = args[0].lower() if args else ""
+        
+        if cmd == "/status":
+            st = '🛑 PAUSED' if live_settings['GLOBAL_STOP'] else '🟢 LIVE'
+            self.send(f"📊 **V35.00 PORTFOLIO MANAGER**\nState: {st}\n🌍 BTC Trend: **{global_btc_trend}**\n🔒 Max Pos: `{live_settings['MAX_OPEN_POSITIONS']}`\n💰 Risk: `${live_settings['RISK_PER_TRADE']}`")
+        
+        elif cmd == "/scan":
+            if not scan_cache: self.send("⏳ Syncing..."); return
+            m = f"**🧗 MARKET: {global_btc_trend}**\n```\nSym          Mode   Sig\n" + "-"*26 + "\n"
+            for s, d in list(scan_cache.items())[:15]: m += f"{s:<12} {d['mode'][:5]}  {d['slope']}\n"
+            self.send(m + "```")
 
-            ticker = self.exchange.fetch_ticker(symbol)
-            price = ticker['last']
-            atr = self.get_atr(symbol)
-            if not atr: return
+        elif cmd == "/balance":
+            bal = BybitPrivate.get_balance()
+            self.send(f"💰 Balance: `${bal:.2f}`\nTrades: {len(active_symbols)}/{live_settings['MAX_OPEN_POSITIONS']}")
 
-            if signal == 'BUY':
-                sl = price - (atr * ATR_MULTIPLIER_SL)
-                tp = price + (atr * ATR_MULTIPLIER_TP)
-                side = 'buy'
-            else:
-                sl = price + (atr * ATR_MULTIPLIER_SL)
-                tp = price - (atr * ATR_MULTIPLIER_TP)
-                side = 'sell'
-
-            size = RISK_PER_TRADE / (atr * ATR_MULTIPLIER_SL)
-            cost = size * price
-            if cost > MAX_POSITION_SIZE: size = MAX_POSITION_SIZE / price
-
-            params = {'stopLoss': str(self.exchange.price_to_precision(symbol, sl)), 'takeProfit': str(self.exchange.price_to_precision(symbol, tp))}
-            if side == 'buy': self.exchange.create_market_buy_order(symbol, size, params=params)
-            else: self.exchange.create_market_sell_order(symbol, size, params=params)
-            logger.info(f"✅ ENTRY: {self.name} OPENED {symbol} {side.upper()}")
-        except Exception as e:
-            logger.error(f"❌ Exec Error: {e}")
-
-    def run(self):
-        logger.info(f"🟢 {self.name} Bot Started")
-        while True:
-            self.manage_positions()
-            current_coins = swing_watchlist if self.name == "SWING" else scalp_watchlist
-            if not current_coins:
-                time.sleep(10)
-                continue
-
-            for symbol in current_coins:
-                try:
-                    tv_symbol = symbol.split('/')[0] + "USDT"
-                    handler = TA_Handler(symbol=tv_symbol, exchange="BYBIT", screener="CRYPTO", interval=self.interval)
-                    res = handler.get_analysis()
-                    rec = res.summary['RECOMMENDATION']
-                    rsi = res.indicators.get('RSI', 50)
-                    macd = res.indicators.get('MACD.macd', 0)
-                    sig = res.indicators.get('MACD.signal', 0)
-
-                    if "BUY" in rec and rsi < 70 and macd > sig: self.execute_trade(symbol, 'BUY')
-                    elif "SELL" in rec and rsi > 30 and macd < sig: self.execute_trade(symbol, 'SELL')
-                    time.sleep(2)
+        elif cmd == "/risk":
+            if len(args) > 1:
+                try: live_settings['RISK_PER_TRADE'] = float(args[1]); save_settings(); self.send(f"✅ Risk: `${live_settings['RISK_PER_TRADE']}`")
                 except: pass
+            else: self.send(f"Current Risk: `${live_settings['RISK_PER_TRADE']}`")
+
+        elif cmd == "/adx":
+            if len(args) > 1:
+                try: live_settings['ADX_THRESHOLD'] = float(args[1]); save_settings(); self.send(f"✅ ADX: `{live_settings['ADX_THRESHOLD']}`")
+                except: pass
+
+        elif cmd == "/pause":
+            live_settings['GLOBAL_STOP'] = True; save_settings(); self.send("🛑 **PAUSED**")
+        
+        elif cmd == "/resume":
+            live_settings['GLOBAL_STOP'] = False; save_settings(); self.send("🟢 **LIVE**")
+
+        elif cmd == "/kill":
+            self.send("⚠️ **KILLING ALL...**"); BybitPrivate.kill_all(); self.send("✅ Done.")
+
+        elif cmd == "/reboot":
+            self.send("♻️ Rebooting..."); time.sleep(1); sys.exit(0)
+
+    def poll(self):
+        while True:
+            try:
+                r = requests.get(f"{self.url}/getUpdates?offset={self.offset}&timeout=10", timeout=15).json()
+                for u in r.get("result", []):
+                    self.offset = u["update_id"] + 1
+                    if "message" in u and "text" in u["message"]: self.handle(u["message"]["text"])
+            except: time.sleep(2)
+
+# --- PORTFOLIO LOOP ---
+def scanner_loop():
+    global scan_cache, active_symbols, global_btc_trend, last_trade_time
+    bot_ui = TelegramBot()
+    
+    while True:
+        global_btc_trend = ExpertEngine.check_btc_trend()
+        previous_symbols = set(active_symbols)
+        active_symbols = BybitPrivate.get_open_positions()
+        
+        # Detect Closed Trades -> Start Cooldown
+        for s in previous_symbols:
+            if s not in active_symbols:
+                last_trade_time[s] = time.time()
+                logging.info(f"COOLDOWN STARTED: {s}")
+
+        if live_settings['GLOBAL_STOP']: time.sleep(5); continue
             
-            time.sleep(60 if self.name == "SCALP" else 300)
+        try:
+            tmp = {}
+            # --- SCALP SCAN ---
+            for symbol in SCALP_TARGETS:
+                # 1. Check if already open
+                if symbol in active_symbols: continue
+                # 2. Check Cooldown (Anti-Chop)
+                if time.time() - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
+                # 3. Check Max Positions
+                if len(active_symbols) >= live_settings['MAX_OPEN_POSITIONS']: continue
+
+                data = ExpertEngine.get_market_info(symbol, SCALP_CONF['interval'])
+                if data:
+                    tmp[symbol] = {**data, "mode": "SCALP"}
+                    if data['slope'] != "WAIT":
+                        if BybitPrivate.place_order(symbol, "Buy" if data['slope']=="LONG" else "Sell", data['price'], data['atr'], SCALP_CONF):
+                            bot_ui.send(f"⚡ **SCALP ENTRY: {symbol}**\nSig: {data['slope']} | ATR: {data['atr']:.4f}")
+                            active_symbols.append(symbol)
+
+            # --- SWING SCAN ---
+            for symbol in SWING_TARGETS:
+                if symbol in active_symbols: continue
+                if time.time() - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
+                if len(active_symbols) >= live_settings['MAX_OPEN_POSITIONS']: continue
+
+                data = ExpertEngine.get_market_info(symbol, SWING_CONF['interval'])
+                if data:
+                    tmp[symbol] = {**data, "mode": "SWING"}
+                    if data['slope'] != "WAIT":
+                        if BybitPrivate.place_order(symbol, "Buy" if data['slope']=="LONG" else "Sell", data['price'], data['atr'], SWING_CONF):
+                            bot_ui.send(f"🐢 **SWING ENTRY: {symbol}**\nSig: {data['slope']} | ATR: {data['atr']:.4f}")
+                            active_symbols.append(symbol)
+
+            scan_cache = tmp
+            logging.info(f"Scan Done. BTC: {global_btc_trend} | Active: {len(active_symbols)}")
+            time.sleep(60)
+        except Exception as e: logging.error(f"Scan Error: {e}"); time.sleep(10)
 
 if __name__ == "__main__":
-    scanner = MarketScanner()
-    news = NewsSentinel() 
-    swing = BotInstance("SWING", Interval.INTERVAL_15_MINUTES)
-    scalp = BotInstance("SCALP", Interval.INTERVAL_5_MINUTES)
-
-    threading.Thread(target=scanner.run, name="SCANNER").start()
-    threading.Thread(target=news.run, name="NEWS").start()
-    time.sleep(5)
-    threading.Thread(target=swing.run, name="SWING").start()
-    threading.Thread(target=scalp.run, name="SCALP").start()
+    print("🚀 BOT V35.00 PORTFOLIO MANAGER STARTING...")
+    t_bot = TelegramBot()
+    threading.Thread(target=t_bot.poll, daemon=True).start()
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    while True: time.sleep(1)

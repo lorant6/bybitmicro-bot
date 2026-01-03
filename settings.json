@@ -1,0 +1,19 @@
+{
+    "MAX_OPEN_POSITIONS": 6,
+    "RISK_PER_TRADE_USDT": 2.0,
+    "ADX_THRESHOLD": 20.0,
+    "GLOBAL_STOP": false,
+    "SWING": {
+        "ATR_SL": 1.5,
+        "ATR_TP": 4.0,
+        "INTERVAL": "15m"
+    },
+    "SCALP": {
+        "ATR_SL": 1.5,
+        "ATR_TP": 2.0,
+        "INTERVAL": "5m"
+    },
+    "NEWS_GUARD": false,
+    "NEWS_GUARD_PAUSE": false,
+    "ADX_FILTER_ACTIVE": true
+}

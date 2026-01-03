@@ -23,12 +23,12 @@ for s, d in tickers.items():
 
 # 1. SWING LIST (High Volume)
 valid.sort(key=lambda x: x['vol'], reverse=True)
-swing_watchlist = [x['symbol'] for x in valid[:12]]
+swing_watchlist = [x['symbol'] for x in valid[:20]]
 
 # 2. SCALP LIST (High Volatility)
 scalp_cands = [x for x in valid if x['symbol'] not in swing_watchlist]
 scalp_cands.sort(key=lambda x: x['chg'], reverse=True)
-scalp_watchlist = [x['symbol'] for x in scalp_cands[:12]]
+scalp_watchlist = [x['symbol'] for x in scalp_cands[:20]]
 
 # --- PRINT RESULTS ---
 print(f"\n{Fore.CYAN}💎 SWING LIST (Top Volume):{Style.RESET_ALL}")
