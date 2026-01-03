@@ -27,19 +27,20 @@ live_settings = {
     "MAX_FUNDING_RATE": 0.001, 
     "STALEMATE_HOURS": 4,      
     "GOD_MODE": True,
-    "AUTO_SCALE": True         
+    "AUTO_SCALE": True,
+    "PAUSE_UNTIL": 0 # New: For Circuit Breaker
 }
 
 # --- DYNAMIC LISTS & DATA ---
 SCALP_TARGETS = []
 SWING_TARGETS = []
 fear_greed_index = {"value": 50, "label": "Neutral"} 
+recent_losses_timestamps = [] # New: Track loss velocity
 
-# --- STRATEGY CONFIG (UPDATED FOR BREATHING ROOM) ---
-# Old: sl_atr 2.0 -> New: 3.5 (Wider)
-# Old: trail_cb 0.3 -> New: 0.8 (Less sensitive)
-SCALP_CONF = {"interval": "15", "sl_atr": 3.5, "trail_active_atr": 1.5, "trail_cb_atr": 0.8}
-SWING_CONF = {"interval": "60", "sl_atr": 5.0, "trail_active_atr": 2.5, "trail_cb_atr": 1.2}
+# --- STRATEGY CONFIG (FIXED FOR PROFIT TAKING) ---
+# Hard Stop is WIDE (3.0), but Trailing Activates EARLY (0.5)
+SCALP_CONF = {"interval": "15", "sl_atr": 3.0, "trail_active_atr": 0.5, "trail_cb_atr": 0.5}
+SWING_CONF = {"interval": "60", "sl_atr": 5.0, "trail_active_atr": 1.5, "trail_cb_atr": 1.0}
 
 COOLDOWN_MINUTES = 90 
 scan_cache = {}
@@ -69,6 +70,19 @@ if os.path.exists(SETTINGS_FILE):
     try:
         with open(SETTINGS_FILE, "r") as f: live_settings.update(json.load(f))
     except: pass
+
+# --- CIRCUIT BREAKER (STRIKE 3) ---
+def check_loss_circuit_breaker():
+    global recent_losses_timestamps, live_settings
+    now = time.time()
+    # Keep only losses from the last 60 minutes
+    recent_losses_timestamps = [t for t in recent_losses_timestamps if now - t < 3600]
+    
+    if len(recent_losses_timestamps) >= 3:
+        live_settings['PAUSE_UNTIL'] = now + 7200 # Pause for 2 hours
+        save_settings()
+        return True
+    return False
 
 # --- INTERNET SENSOR ---
 def fetch_fear_and_greed():
@@ -128,9 +142,13 @@ def log_trade_exit(symbol, exit_price, pnl):
 
 # --- AUTO SCALER ---
 def adjust_risk_based_on_performance(pnl):
-    global wins, losses, win_rate
-    if pnl > 0: wins += 1
-    else: losses += 1
+    global wins, losses, win_rate, recent_losses_timestamps
+    if pnl > 0: 
+        wins += 1
+    else: 
+        losses += 1
+        recent_losses_timestamps.append(time.time()) # Add timestamp of loss
+        
     total = wins + losses
     if total < 5: return 
 
@@ -408,8 +426,14 @@ class TelegramBot:
         cmd = args[0].lower() if args else ""
         
         if cmd == "/status":
-            st = '🛑 PAUSED' if live_settings['GLOBAL_STOP'] else '🟢 LIVE'
-            self.send(f"🤖 **V59.00 WIDE STOPS**\nState: {st}\n🌍 BTC: **{global_btc_trend}**\n🧠 Mood: **{fear_greed_index['label']}** ({fear_greed_index['value']})\n📉 PnL: `${daily_pnl:.2f}`\n💰 Risk: `${live_settings['RISK_PER_TRADE']}`\n📈 WinRate: `{win_rate:.1f}%`")
+            now = time.time()
+            if live_settings.get('PAUSE_UNTIL', 0) > now:
+                mins = int((live_settings['PAUSE_UNTIL'] - now) / 60)
+                st = f"⛔ **CIRCUIT BREAKER ({mins}m left)**"
+            else:
+                st = '🛑 PAUSED' if live_settings['GLOBAL_STOP'] else '🟢 LIVE'
+            
+            self.send(f"🤖 **V60.00 SMART TRAIL + BREAKER**\nState: {st}\n🌍 BTC: **{global_btc_trend}**\n🧠 Mood: **{fear_greed_index['label']}** ({fear_greed_index['value']})\n📉 PnL: `${daily_pnl:.2f}`\n💰 Risk: `${live_settings['RISK_PER_TRADE']}`\n📈 WinRate: `{win_rate:.1f}%`")
         
         elif cmd == "/risk":
             if len(args) > 1:
@@ -535,7 +559,7 @@ class TelegramBot:
             live_settings['GLOBAL_STOP'] = True; save_settings(); self.send("🛑 **PAUSED**")
         
         elif cmd == "/resume":
-            live_settings['GLOBAL_STOP'] = False; save_settings(); self.send("🟢 **LIVE**")
+            live_settings['GLOBAL_STOP'] = False; live_settings['PAUSE_UNTIL'] = 0; save_settings(); self.send("🟢 **LIVE**")
 
         elif cmd == "/kill":
             self.send("⚠️ **KILLING ALL...**"); BybitPrivate.kill_all(); self.send("✅ Done.")
@@ -584,7 +608,13 @@ def scanner_loop():
 
     while True:
         daily_pnl = BybitPrivate.get_today_pnl()
-        
+        now = time.time()
+
+        # CHECK CIRCUIT BREAKER STATUS
+        if live_settings.get('PAUSE_UNTIL', 0) > now:
+            # We are in Circuit Breaker mode
+            time.sleep(30); continue
+
         if not live_settings['GLOBAL_STOP']:
             if daily_pnl <= live_settings['DAILY_LOSS_LIMIT']:
                 live_settings['GLOBAL_STOP'] = True; save_settings(); bot_ui.send(f"⛔ **CIRCUIT BREAKER**\nDaily Loss: `${daily_pnl:.2f}`")
@@ -592,14 +622,14 @@ def scanner_loop():
                 live_settings['GLOBAL_STOP'] = True; save_settings(); bot_ui.send(f"🏆 **TARGET HIT**\nDaily Profit: `${daily_pnl:.2f}`")
 
         # 4H: Refresh Market List
-        if time.time() - last_market_update > 14400:
+        if now - last_market_update > 14400:
             MarketSelector.refresh_lists()
-            last_market_update = time.time()
+            last_market_update = now
 
         # 4H: Refresh Internet Sentiment (Fear & Greed)
-        if time.time() - last_fng_update > 14400:
+        if now - last_fng_update > 14400:
             fetch_fear_and_greed()
-            last_fng_update = time.time()
+            last_fng_update = now
 
         global_btc_trend = ExpertEngine.check_btc_trend()
         
@@ -609,7 +639,7 @@ def scanner_loop():
         
         for s in active_symbols:
             if s not in new_active:
-                last_trade_time[s] = time.time() 
+                last_trade_time[s] = now
         
         active_symbols = new_active
         
@@ -631,7 +661,7 @@ def scanner_loop():
                 log_trade_exit(s, exit_price, pnl)
                 adjust_risk_based_on_performance(pnl)
                 
-                if time.time() - ts < 900: 
+                if now - ts < 900: 
                     msg = f"💰 **PROFIT:** {s} (+${pnl:.2f})" if pnl > 0 else f"☠️ **BLACKLISTED {s}**\nReason: Stop Loss."
                     bot_ui.send(f"{msg}")
 
@@ -639,17 +669,21 @@ def scanner_loop():
                     if pnl < 0:
                         loss_streak[s] = loss_streak.get(s, 0) + 1
                         if loss_streak[s] >= 2:
-                            if s in pardoned_coins and (time.time() - pardoned_coins[s] < 86400):
+                            if s in pardoned_coins and (now - pardoned_coins[s] < 86400):
                                 bot_ui.send(f"🛡️ **PARDON SHIELD:** {s} had a loss, but is protected.")
                             else:
-                                blacklisted[s] = time.time() + 86400
+                                blacklisted[s] = now + 86400
+                        
+                        # CHECK FOR CIRCUIT BREAKER TRIGGER
+                        if check_loss_circuit_breaker():
+                            bot_ui.send("⚡ **CIRCUIT BREAKER TRIGGERED**\n3 Losses in 60m. Pausing buys for 2 hours.")
                     else:
                         loss_streak[s] = 0
 
         # 3. ZOMBIE KILLER
-        now_ms = time.time() * 1000
+        now_ms = now * 1000
         for s, details in current_positions.items():
-            if s in last_entry_time and (time.time() - last_entry_time[s] < 3600):
+            if s in last_entry_time and (now - last_entry_time[s] < 3600):
                 continue
             duration_hours = (now_ms - details['created']) / 3600000.0
             if s in SCALP_TARGETS and duration_hours > live_settings['STALEMATE_HOURS']:
@@ -663,8 +697,8 @@ def scanner_loop():
             tmp = {}
             for symbol in SCALP_TARGETS:
                 if symbol in active_symbols: continue
-                if symbol in blacklisted and time.time() < blacklisted[symbol]: continue
-                if time.time() - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
+                if symbol in blacklisted and now < blacklisted[symbol]: continue
+                if now - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
                 if len(active_symbols) >= live_settings['MAX_OPEN_POSITIONS']: continue
 
                 data = ExpertEngine.get_market_info(symbol, SCALP_CONF['interval'])
@@ -680,15 +714,15 @@ def scanner_loop():
                         trade_log = {"mode": "SCALP", "rsi": data['rsi'], "adx": data['adx'], "atr": data['atr'], "trend": htf_trend}
                         
                         if BybitPrivate.place_order(symbol, "Buy" if data['slope']=="LONG" else "Sell", data['price'], data['atr'], SCALP_CONF, size_mult, trade_log):
-                            last_entry_time[symbol] = time.time()
+                            last_entry_time[symbol] = now
                             active_symbols.append(symbol) 
                             boost_msg = "🔥 **GOD HAND (1.5x)**" if size_mult > 1 else ""
                             bot_ui.send(f"⚡ **SCALP ENTRY:** {symbol}\nSig: {data['slope']} | {boost_msg}")
 
             for symbol in SWING_TARGETS:
                 if symbol in active_symbols: continue
-                if symbol in blacklisted and time.time() < blacklisted[symbol]: continue
-                if time.time() - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
+                if symbol in blacklisted and now < blacklisted[symbol]: continue
+                if now - last_trade_time.get(symbol, 0) < (COOLDOWN_MINUTES * 60): continue
                 if len(active_symbols) >= live_settings['MAX_OPEN_POSITIONS']: continue
 
                 data = ExpertEngine.get_market_info(symbol, SWING_CONF['interval'])
@@ -698,7 +732,7 @@ def scanner_loop():
                         trade_log = {"mode": "SWING", "rsi": data['rsi'], "adx": data['adx'], "atr": data['atr'], "trend": "SWING"}
                         
                         if BybitPrivate.place_order(symbol, "Buy" if data['slope']=="LONG" else "Sell", data['price'], data['atr'], SWING_CONF, 1.0, trade_log):
-                            last_entry_time[symbol] = time.time()
+                            last_entry_time[symbol] = now
                             active_symbols.append(symbol) 
                             bot_ui.send(f"🐢 **SWING ENTRY: {symbol}**\nSig: {data['slope']}")
 
@@ -708,7 +742,7 @@ def scanner_loop():
         except Exception as e: logging.error(f"Scan Error: {e}"); time.sleep(10)
 
 if __name__ == "__main__":
-    print("🚀 BOT V59.00 WIDE STOPS STARTING...")
+    print("🚀 BOT V60.00 SMART TRAIL + BREAKER STARTING...")
     t_bot = TelegramBot()
     threading.Thread(target=t_bot.poll, daemon=True).start()
     threading.Thread(target=scanner_loop, daemon=True).start()
